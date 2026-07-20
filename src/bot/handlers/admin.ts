@@ -2,7 +2,6 @@ import { Context } from 'grammy';
 import { UserService } from '../../database/services/userService';
 import { ChatService } from '../../database/services/chatService';
 import { Report } from '../../database/models/Report';
-import { Transaction } from '../../database/models/Transaction';
 import { AdminLog } from '../../database/models/AdminLog';
 import { User } from '../../database/models/User';
 import { Campaign } from '../../database/models/Campaign';
@@ -10,6 +9,7 @@ import { adminKeyboard } from '../utils/keyboards';
 import { t } from '../utils/i18n';
 import { config } from '../../config';
 
+// ===== Stats =====
 export async function adminStatsHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;
@@ -28,6 +28,7 @@ export async function adminStatsHandler(ctx: Context) {
   await ctx.reply(msg, { parse_mode: 'HTML' });
 }
 
+// ===== Broadcast =====
 export async function adminBroadcastHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;
@@ -37,20 +38,26 @@ export async function adminBroadcastHandler(ctx: Context) {
 
 export async function sendBroadcast(ctx: Context, messageText: string) {
   const telegramId = ctx.from?.id!;
-  const users = await User.find({ status: 'active', isOnline: true });
+  const users = await User.find({ status: 'active' });
   let sent = 0;
+  let failed = 0;
 
   for (const user of users) {
     try {
       await ctx.api.sendMessage(user.telegramId, messageText, { parse_mode: 'HTML' } as any);
       sent++;
-    } catch {}
+    } catch {
+      failed++;
+    }
+    // Rate-limit to avoid flood
+    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 1000));
   }
 
-  await ctx.reply(`✅ پیام به ${sent} کاربر ارسال شد.`);
-  await AdminLog.create({ adminId: telegramId, action: 'broadcast', details: `Sent to ${sent} users` });
+  await ctx.reply(`✅ پیام به ${sent} کاربر ارسال شد.\n❌ ناموفق: ${failed}`);
+  await AdminLog.create({ adminId: telegramId, action: 'broadcast', details: `Sent to ${sent}, failed: ${failed}` });
 }
 
+// ===== Targeted Broadcast =====
 export async function adminTargetedBroadcastHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;
@@ -63,6 +70,45 @@ export async function adminTargetedBroadcastHandler(ctx: Context) {
   );
 }
 
+export async function sendTargetedBroadcast(ctx: Context, filterText: string) {
+  const telegramId = ctx.from?.id!;
+  if (!config.admins.includes(telegramId)) return;
+
+  // Parse filter text into filters object
+  const filters: any = {};
+  const lines = filterText.split('\n');
+  const filterLine = lines[0];
+  const messageLines = lines.slice(1);
+
+  filterLine.split(',').forEach(part => {
+    const [key, value] = part.trim().split('=');
+    if (key && value) {
+      const k = key.trim();
+      if (k === 'minAge' || k === 'maxAge' || k === 'minCoins' || k === 'maxCoins') {
+        filters[k] = parseInt(value);
+      } else {
+        filters[k] = value;
+      }
+    }
+  });
+
+  const message = messageLines.join('\n') || filterLine;
+  const users = await UserService.findTargetedUsers(filters);
+  let sent = 0;
+
+  for (const user of users) {
+    try {
+      await ctx.api.sendMessage(user.telegramId, `📢 ${message}`, { parse_mode: 'HTML' } as any);
+      sent++;
+    } catch {}
+    if (sent % 20 === 0) await new Promise(r => setTimeout(r, 1000));
+  }
+
+  await ctx.reply(`🎯 پیام هدفمند به ${sent} کاربر ارسال شد.`);
+  await AdminLog.create({ adminId: telegramId, action: 'targeted_broadcast', details: `Filters: ${filterLine}, sent: ${sent}` });
+}
+
+// ===== Coin Management =====
 export async function adminManageCoinsHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;
@@ -70,6 +116,35 @@ export async function adminManageCoinsHandler(ctx: Context) {
   await ctx.reply('💰 مدیریت سکه\n\nفرمت: `userId amount reason`\nمثال: `123456789 50 برای فعالیت خوب`');
 }
 
+export async function manageCoins(ctx: Context, text: string) {
+  const telegramId = ctx.from?.id!;
+  if (!config.admins.includes(telegramId)) return;
+
+  const parts = text.split(' ');
+  if (parts.length < 3) {
+    await ctx.reply('❌ فرمت اشتباه. استفاده: `userId amount reason`');
+    return;
+  }
+
+  const userId = parseInt(parts[0]);
+  const amount = parseInt(parts[1]);
+  const reason = parts.slice(2).join(' ');
+
+  if (isNaN(userId) || isNaN(amount)) {
+    await ctx.reply('❌ userId و amount باید عدد باشند.');
+    return;
+  }
+
+  const user = await UserService.addCoins(userId, amount, reason);
+  if (user) {
+    await ctx.reply(`✅ ${amount} سکه به کاربر ${userId} اضافه شد. موجودی جدید: ${user.coins}`);
+    await AdminLog.create({ adminId: telegramId, action: 'manage_coins', targetId: userId, details: `${amount} - ${reason}` });
+  } else {
+    await ctx.reply('❌ کاربر یافت نشد.');
+  }
+}
+
+// ===== Reports =====
 export async function adminReportsHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;
@@ -83,16 +158,62 @@ export async function adminReportsHandler(ctx: Context) {
 
   let msg = '🚨 گزارشات جدید:\n\n';
   for (const r of reports) {
-    msg += `🆔 گزارش: ${r._id.toString().slice(-6)}\n`;
+    msg += `🆔 ${r._id.toString().slice(-6)}\n`;
     msg += `📝 گزارش‌دهنده: ${r.reporterId}\n`;
     msg += `👤 متخلف: ${r.reportedId}\n`;
     msg += `🔴 دلیل: ${r.reason}\n`;
-    msg += `📅 ${r.createdAt.toLocaleDateString('fa-IR')}\n\n`;
+    msg += `📅 ${r.createdAt.toLocaleDateString('fa-IR')}\n`;
+    msg += `─────────────────\n`;
   }
 
-  await ctx.reply(msg + 'برای مدیریت از دستورات زیر استفاده کنید:\n/ban userId\n/unban userId\n/resolve reportId');
+  msg += '\nدستورات:\n/ban userId\n/unban userId\n/resolve reportId';
+
+  await ctx.reply(msg);
 }
 
+export async function adminBanUser(ctx: Context) {
+  const telegramId = ctx.from?.id!;
+  if (!config.admins.includes(telegramId)) return;
+
+  const args = ctx.message?.text?.split(' ');
+  if (!args || args.length < 2) {
+    await ctx.reply('❌ فرمت: /ban userId');
+    return;
+  }
+
+  const userId = parseInt(args[1]);
+  if (isNaN(userId)) {
+    await ctx.reply('❌ userId باید عدد باشد.');
+    return;
+  }
+
+  await UserService.toggleBan(userId, true);
+  await ctx.reply(`🔇 کاربر ${userId} مسدود شد.`);
+  await AdminLog.create({ adminId: telegramId, action: 'ban', targetId: userId });
+}
+
+export async function adminUnbanUser(ctx: Context) {
+  const telegramId = ctx.from?.id!;
+  if (!config.admins.includes(telegramId)) return;
+
+  const args = ctx.message?.text?.split(' ');
+  if (!args || args.length < 2) {
+    await ctx.reply('❌ فرمت: /unban userId');
+    return;
+  }
+
+  const userId = parseInt(args[1]);
+  if (isNaN(userId)) {
+    await ctx.reply('❌ userId باید عدد باشد.');
+    return;
+  }
+
+  await UserService.toggleBan(userId, false);
+  await ctx.reply(`✅ کاربر ${userId} رفع مسدود شد.`);
+  await AdminLog.create({ adminId: telegramId, action: 'unban', targetId: userId });
+}
+
+// ===== Campaigns =====
 export async function adminCampaignHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;
@@ -114,6 +235,7 @@ export async function adminCampaignHandler(ctx: Context) {
   await ctx.reply(msg);
 }
 
+// ===== Settings =====
 export async function adminSettingsHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   if (!config.admins.includes(telegramId)) return;

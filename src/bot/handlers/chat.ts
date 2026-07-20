@@ -3,10 +3,12 @@ import { UserService } from '../../database/services/userService';
 import { ChatService } from '../../database/services/chatService';
 import { User } from '../../database/models/User';
 import { Chat } from '../../database/models/Chat';
+import { Report } from '../../database/models/Report';
 import { chatKeyboard, endChatKeyboard, reportReasonKeyboard } from '../utils/keyboards';
 import { t } from '../utils/i18n';
 import { config } from '../../config';
 
+// ===== Start Random Chat =====
 export async function startChatHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   const user = await UserService.getById(telegramId);
@@ -17,11 +19,12 @@ export async function startChatHandler(ctx: Context) {
     return;
   }
 
+  // Set user as waiting
   await User.updateOne({ telegramId }, { chatStatus: 'waiting', isOnline: true });
   await ctx.reply(t.findingPartner, { parse_mode: 'HTML' });
 
+  // Try to find a partner
   const partner = await UserService.searchForPartner(telegramId);
-
   if (partner) {
     const chat = await ChatService.createChat(telegramId, partner.telegramId);
 
@@ -49,20 +52,28 @@ export async function startChatHandler(ctx: Context) {
       await ctx.reply('❌ هم‌صحبت شما ربات را مسدود کرده است.');
     }
   } else {
+    // No partner found, timeout after waiting period
     setTimeout(async () => {
       const stillWaiting = await User.findOne({ telegramId, chatStatus: 'waiting' });
       if (stillWaiting) {
         await User.updateOne({ telegramId }, { chatStatus: 'idle' });
-        try { await ctx.reply(t.noChatPartner, { parse_mode: 'HTML' }); } catch {}
+        try {
+          const msg = await ctx.reply(t.noChatPartner, { parse_mode: 'HTML' });
+          setTimeout(() => ctx.deleteMessages([msg.message_id]), 5000);
+        } catch {}
       }
     }, config.limits.waitingTimeout);
   }
 }
 
+// ===== End Chat =====
 export async function endChatHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   const chat = await ChatService.getActiveChat(telegramId);
-  if (!chat) { await ctx.reply('شما در حال حاضر چت فعالی ندارید.'); return; }
+  if (!chat) {
+    await ctx.reply('شما در حال حاضر چت فعالی ندارید.');
+    return;
+  }
   await ctx.reply('آیا مطمئن هستید؟', { reply_markup: endChatKeyboard() });
 }
 
@@ -88,41 +99,59 @@ export async function nextChatHandler(ctx: Context) {
   setTimeout(() => startChatHandler(ctx), 500);
 }
 
+// ===== Like =====
 export async function likeUserHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   const chat = await ChatService.getActiveChat(telegramId);
-  if (!chat) { await ctx.reply('چت فعالی وجود ندارد.'); return; }
+  if (!chat) {
+    await ctx.reply('چت فعالی وجود ندارد.');
+    return;
+  }
   await ChatService.likeUser(chat._id.toString(), telegramId);
-  await ctx.answerCallbackQuery?.({ text: '❤️ لایک شد!' });
+  await ctx.reply('❤️ لایک ثبت شد!');
 }
 
+// ===== Report =====
 export async function reportUserHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   const chat = await ChatService.getActiveChat(telegramId);
-  if (!chat) { await ctx.reply('چت فعالی وجود ندارد.'); return; }
-  await ctx.reply(t.reportReason, { reply_markup: reportReasonKeyboard(chat._id.toString()), parse_mode: 'HTML' });
+  if (!chat) {
+    await ctx.reply('چت فعالی وجود ندارد.');
+    return;
+  }
+  await ctx.reply(t.reportReason, {
+    reply_markup: reportReasonKeyboard(chat._id.toString()),
+    parse_mode: 'HTML',
+  });
 }
 
+// ===== Block =====
 export async function blockUserHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   const chat = await ChatService.getActiveChat(telegramId);
-  if (!chat) { await ctx.reply('چت فعالی وجود ندارد.'); return; }
+  if (!chat) {
+    await ctx.reply('چت فعالی وجود ندارد.');
+    return;
+  }
   const partnerId = chat.users.find(u => u !== telegramId);
   if (partnerId) {
     await User.updateOne({ telegramId }, { $addToSet: { blockedUsers: partnerId } });
     await ctx.reply(t.blocked, { parse_mode: 'HTML' });
-    await confirmEndChat(ctx);
+    await ChatService.endChat(chat._id.toString(), telegramId);
   }
 }
 
+// ===== Forward Chat Messages =====
 export async function chatMessageHandler(ctx: Context) {
   const telegramId = ctx.from?.id!;
   const chat = await ChatService.getActiveChat(telegramId);
   if (!chat) return;
+
   const partnerId = chat.users.find(u => u !== telegramId);
   if (!partnerId) return;
+
   const text = ctx.message?.text;
-  if (!text) return;
+  if (!text || text.startsWith('/')) return;
 
   try {
     await ctx.api.sendMessage(partnerId, text, { parse_mode: 'HTML' } as any);
@@ -131,4 +160,11 @@ export async function chatMessageHandler(ctx: Context) {
     await ctx.reply('❌ هم‌صحبت شما قادر به دریافت پیام نیست.');
     await ChatService.endChat(chat._id.toString(), telegramId);
   }
+}
+
+// ===== Direct Message =====
+export async function directMessageHandler(ctx: Context) {
+  // This would be triggered from a user's liked users list
+  // For now, it's a placeholder
+  await ctx.reply('📨 برای ارسال پیام دایرکت، از لیست کاربرانی که لایک کردید انتخاب کنید.');
 }

@@ -4,13 +4,14 @@ import { connectDatabase } from '../database/connection';
 import { startHandler } from './handlers/start';
 import { profileHandler, editProfileHandler, profileStates } from './handlers/profile';
 import { startChatHandler, endChatHandler, confirmEndChat, nextChatHandler, likeUserHandler, reportUserHandler, blockUserHandler, chatMessageHandler } from './handlers/chat';
-import { adminStatsHandler, adminBroadcastHandler, sendBroadcast, adminTargetedBroadcastHandler, adminManageCoinsHandler, adminReportsHandler, adminCampaignHandler, adminSettingsHandler } from './handlers/admin';
+import { adminStatsHandler, adminBroadcastHandler, sendBroadcast, adminTargetedBroadcastHandler, sendTargetedBroadcast, adminManageCoinsHandler, manageCoins, adminReportsHandler, adminBanUser, adminUnbanUser, adminCampaignHandler, adminSettingsHandler } from './handlers/admin';
 import { mainKeyboard, adminKeyboard } from './utils/keyboards';
 import { t } from './utils/i18n';
 import { UserService } from '../database/services/userService';
-import { WalletService } from '../database/services/walletService';
 import { User } from '../database/models/User';
+import { Chat } from '../database/models/Chat';
 import { Report } from '../database/models/Report';
+import { AdminLog } from '../database/models/AdminLog';
 import chalk from 'chalk';
 
 interface SessionData {
@@ -18,6 +19,7 @@ interface SessionData {
   awaitingBroadcastMessage: boolean;
   awaitingTargetedBroadcast: boolean;
   awaitingCoinManagement: boolean;
+  awaitingAdvancedSearch: boolean;
 }
 
 type MyContext = Context & SessionFlavor<SessionData>;
@@ -28,10 +30,35 @@ export async function startBot() {
   const bot = new Bot<MyContext>(config.bot.token);
 
   // Session
-  bot.use(session({ initial: (): SessionData => ({ awaitingProfileInput: null, awaitingBroadcastMessage: false, awaitingTargetedBroadcast: false, awaitingCoinManagement: false }) }));
+  bot.use(session({ 
+    initial: (): SessionData => ({ 
+      awaitingProfileInput: null, 
+      awaitingBroadcastMessage: false, 
+      awaitingTargetedBroadcast: false, 
+      awaitingCoinManagement: false,
+      awaitingAdvancedSearch: false,
+    }) 
+  }));
 
   // ===== COMMANDS =====
   bot.command('start', startHandler);
+
+  // ===== ADMIN COMMANDS =====
+  bot.command('ban', adminBanUser);
+  bot.command('unban', adminUnbanUser);
+  bot.command('resolve', async (ctx) => {
+    const telegramId = ctx.from!.id;
+    if (!config.admins.includes(telegramId)) return;
+    const args = ctx.message?.text?.split(' ');
+    if (args && args.length >= 2) {
+      const reportId = args[1];
+      await Report.updateOne({ _id: reportId }, { resolved: true, resolvedBy: telegramId });
+      await ctx.reply(`✅ گزارش ${reportId} بسته شد.`);
+      await AdminLog.create({ adminId: telegramId, action: 'resolve_report', details: reportId });
+    } else {
+      await ctx.reply('❌ فرمت: /resolve reportId');
+    }
+  });
 
   // ===== TEXT HANDLERS =====
   bot.hears(t.startChat, startChatHandler);
@@ -50,7 +77,6 @@ export async function startBot() {
     if (user.coins < config.coins.radarCost) { await ctx.reply(t.notEnoughCoins(config.coins.radarCost)); return; }
     await UserService.spendCoins(user.telegramId, config.coins.radarCost, 'رادار');
 
-    // Find nearby users
     const nearby = await User.find({
       telegramId: { $ne: user.telegramId },
       status: 'active',
@@ -119,6 +145,10 @@ export async function startBot() {
     await confirmEndChat(ctx);
     await ctx.answerCallbackQuery();
   });
+  bot.callbackQuery('cancel_end_chat', async (ctx) => {
+    await ctx.deleteMessage();
+    await ctx.answerCallbackQuery();
+  });
   bot.callbackQuery('next_chat', nextChatHandler);
   bot.callbackQuery('like_user', likeUserHandler);
   bot.callbackQuery('report_user', reportUserHandler);
@@ -126,7 +156,7 @@ export async function startBot() {
     const chatId = ctx.match![1];
     const reason = ctx.callbackQuery.data!.split('_')[1];
     const telegramId = ctx.from!.id;
-    const chat = await (await import('../../database/models/Chat')).Chat.findById(chatId);
+    const chat = await Chat.findById(chatId);
     if (!chat) { await ctx.reply('❌ خطا'); return; }
     const reportedId = chat.users.find(u => u !== telegramId);
     if (!reportedId) return;
@@ -135,6 +165,10 @@ export async function startBot() {
     await ctx.answerCallbackQuery();
   });
   bot.callbackQuery('block_user', blockUserHandler);
+  bot.callbackQuery('confirm_report', async (ctx) => {
+    await ctx.reply('🚨 لطفاً دلیل گزارش را انتخاب کنید.');
+    await ctx.answerCallbackQuery();
+  });
   bot.callbackQuery('back_main', async (ctx) => {
     const isAdmin = config.admins.includes(ctx.from!.id);
     await ctx.reply(t.mainMenu, { reply_markup: isAdmin ? adminKeyboard() : mainKeyboard() });
@@ -144,13 +178,16 @@ export async function startBot() {
     await ctx.reply('لغو شد.');
     await ctx.answerCallbackQuery();
   });
+  bot.callbackQuery('contact_support', async (ctx) => {
+    await ctx.reply('📞 برای ارتباط با پشتیبانی به آیدی @llllxyz پیام دهید.');
+    await ctx.answerCallbackQuery();
+  });
 
   // ===== CHAT MESSAGE FORWARDING =====
   bot.on('message:text', async (ctx) => {
-    const telegramId = ctx.from!.id;
     const sessionData = ctx.session;
 
-    // Check if user is in any special input mode
+    // Profile input handlers
     if (sessionData.awaitingProfileInput === 'name') {
       await profileStates.handleNameInput(ctx);
       return;
@@ -168,6 +205,7 @@ export async function startBot() {
       return;
     }
 
+    // Admin: Broadcast message
     if (sessionData.awaitingBroadcastMessage) {
       const text = ctx.message?.text || '';
       await sendBroadcast(ctx, text);
@@ -175,20 +213,42 @@ export async function startBot() {
       return;
     }
 
+    // Admin: Targeted broadcast
+    if (sessionData.awaitingTargetedBroadcast) {
+      const text = ctx.message?.text || '';
+      await sendTargetedBroadcast(ctx, text);
+      sessionData.awaitingTargetedBroadcast = false;
+      return;
+    }
+
+    // Admin: Coin management
     if (sessionData.awaitingCoinManagement) {
       const text = ctx.message?.text || '';
-      const parts = text.split(' ');
-      if (parts.length >= 3) {
-        const userId = parseInt(parts[0]);
-        const amount = parseInt(parts[1]);
-        const reason = parts.slice(2).join(' ');
-        await UserService.addCoins(userId, amount, reason);
-        await ctx.reply(`✅ ${amount} سکه به کاربر ${userId} اضافه شد.`);
-        await AdminLog.create({ adminId: telegramId, action: 'manage_coins', targetId: userId, details: `${amount} - ${reason}` });
-      } else {
-        await ctx.reply('❌ فرمت اشتباه. استفاده: `userId amount reason`');
-      }
+      await manageCoins(ctx, text);
       sessionData.awaitingCoinManagement = false;
+      return;
+    }
+
+    // User: Advanced search filters
+    if (sessionData.awaitingAdvancedSearch) {
+      const text = ctx.message?.text || '';
+      // Parse filters from text (format: gender=male, minAge=18, ...)
+      const filters: any = {};
+      text.split(',').forEach(part => {
+        const [key, value] = part.trim().split('=');
+        if (key && value) {
+          if (key.trim() === 'minAge' || key.trim() === 'maxAge') filters[key.trim()] = parseInt(value);
+          else filters[key.trim()] = value;
+        }
+      });
+      const user = await UserService.searchForPartner(ctx.from!.id, filters);
+      if (user) {
+        await User.findOneAndUpdate({ telegramId: ctx.from!.id }, { chatStatus: 'waiting' });
+        await startChatHandler(ctx);
+      } else {
+        await ctx.reply('🔍 هم‌صحبتی با این فیلترها یافت نشد.');
+      }
+      sessionData.awaitingAdvancedSearch = false;
       return;
     }
 

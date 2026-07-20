@@ -3,7 +3,7 @@ dotenv.config();
 
 export const config = {
   bot: {
-    token: process.env.BOT_TOKEN!,
+    token: process.env.BOT_TOKEN || '',
     username: process.env.BOT_USERNAME || 'AnonymousBot',
   },
 
@@ -29,8 +29,8 @@ export const config = {
   },
 
   limits: {
-    reportThreshold: 5, // Auto-ban after 5 reports
-    waitingTimeout: 120000, // 2 minutes in queue
-    messageRateLimit: 20, // messages per minute
+    reportThreshold: 5,
+    waitingTimeout: 120000,
+    messageRateLimit: 20,
   },
 };

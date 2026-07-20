@@ -16,8 +16,11 @@ export class UserService {
         referralCode: uuidv4().slice(0, 8),
         coins: config.coins.default,
         joinedAt: new Date(),
+        isOnline: true,
+        status: 'active',
+        chatStatus: 'idle',
+        profile: { name: '', gender: 'unknown', age: 0, province: '', city: '', bio: '', instagram: '', isComplete: false },
       });
-      // Log initial coins
       await Transaction.create({
         userId: telegramId,
         type: 'bonus',
@@ -26,7 +29,6 @@ export class UserService {
         description: 'سکه‌های شروع',
       });
     } else {
-      // Update info
       user.username = username || user.username;
       user.firstName = firstName || user.firstName;
       user.lastName = lastName || user.lastName;
@@ -45,14 +47,14 @@ export class UserService {
     const user = await User.findOne({ telegramId });
     if (!user) return null;
 
+    const wasComplete = user.profile.isComplete;
     Object.assign(user.profile, updates);
 
-    // Check if profile is complete
     const p = user.profile;
-    user.profile.isComplete = !!(p.name && p.gender !== 'unknown' && p.age && p.province && p.city);
+    user.profile.isComplete = !!(p.name && p.gender && p.gender !== 'unknown' && p.age && p.age > 0 && p.province && p.city);
 
-    // Bonus for first complete
-    if (user.profile.isComplete && !user.profile.isComplete) {
+    // Bonus for first-time profile completion
+    if (user.profile.isComplete && !wasComplete) {
       user.coins += config.coins.profileCompleteBonus;
       user.totalCoinsEarned += config.coins.profileCompleteBonus;
       await Transaction.create({
@@ -125,12 +127,8 @@ export class UserService {
   }
 
   static async getStats(): Promise<{
-    total: number;
-    online: number;
-    chatting: number;
-    waiting: number;
-    banned: number;
-    today: number;
+    total: number; online: number; chatting: number; waiting: number;
+    banned: number; today: number;
     byGender: { male: number; female: number; unknown: number };
     byProvince: Record<string, number>;
   }> {
@@ -144,9 +142,7 @@ export class UserService {
       User.countDocuments({ chatStatus: 'waiting' }),
       User.countDocuments({ status: 'banned' }),
       User.countDocuments({ joinedAt: { $gte: today } }),
-      User.aggregate([
-        { $group: { _id: '$profile.gender', count: { $sum: 1 } } },
-      ]),
+      User.aggregate([{ $group: { _id: '$profile.gender', count: { $sum: 1 } } }]),
       User.aggregate([
         { $match: { 'profile.province': { $ne: '' } } },
         { $group: { _id: '$profile.province', count: { $sum: 1 } } },
@@ -156,14 +152,10 @@ export class UserService {
     ]);
 
     const genderMap: Record<string, number> = { male: 0, female: 0, unknown: 0 };
-    byGender.forEach((g: { _id: string; count: number }) => {
-      genderMap[g._id] = g.count;
-    });
+    byGender.forEach((g: { _id: string; count: number }) => { genderMap[g._id] = g.count; });
 
     const provinceMap: Record<string, number> = {};
-    byProvince.forEach((p: { _id: string; count: number }) => {
-      provinceMap[p._id] = p.count;
-    });
+    byProvince.forEach((p: { _id: string; count: number }) => { provinceMap[p._id] = p.count; });
 
     return {
       total, online, chatting, waiting, banned, today: todayJoined,
@@ -180,21 +172,22 @@ export class UserService {
     if (!user) return null;
 
     const query: any = {
-      telegramId: { $ne: userId },
       status: 'active',
       chatStatus: 'waiting',
       isOnline: true,
       blockedUsers: { $ne: userId },
     };
 
-    // Exclude blocked users
-    if (user.blockedUsers.length > 0) {
-      query.telegramId.$nin = user.blockedUsers;
-    }
+    // Include userId exclusion AND blocked users exclusion
+    const excludeIds = [userId, ...(user.blockedUsers || [])];
+    query.telegramId = { $nin: excludeIds };
 
     if (filters?.gender) query['profile.gender'] = filters.gender;
-    if (filters?.minAge) query['profile.age'] = { $gte: filters.minAge };
-    if (filters?.maxAge) query['profile.age'] = { ...query['profile.age'], $lte: filters.maxAge };
+    if (filters?.minAge || filters?.maxAge) {
+      query['profile.age'] = {};
+      if (filters.minAge) query['profile.age'].$gte = filters.minAge;
+      if (filters.maxAge) query['profile.age'].$lte = filters.maxAge;
+    }
     if (filters?.province) query['profile.province'] = filters.province;
 
     return User.findOne(query).sort({ lastSeen: -1 });
@@ -202,10 +195,6 @@ export class UserService {
 
   static async toggleBan(telegramId: number, ban: boolean): Promise<void> {
     await User.updateOne({ telegramId }, { status: ban ? 'banned' : 'active' });
-  }
-
-  static async findByProvince(province: string): Promise<number> {
-    return User.countDocuments({ 'profile.province': province, status: 'active' });
   }
 
   static async findTargetedUsers(filters: {
