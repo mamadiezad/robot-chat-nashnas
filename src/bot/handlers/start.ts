@@ -19,6 +19,8 @@ export async function startHandler(ctx: Context) {
 
   const user = await UserService.findOrCreate(telegramId, username, firstName, lastName);
 
+    // Add credit footer
+  await ctx.reply('\n━━━━━━━━━━━━━━━━\n💎 ساخته شده با ❤️ توسط <a href="tg://resolve?domain=llllxyz">Mohammad</a>', { parse_mode: 'HTML' });
   await ctx.reply(t.welcome, {
     parse_mode: 'HTML',
     reply_markup: config.admins.includes(telegramId)
